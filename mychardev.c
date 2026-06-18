@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kfifo.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
@@ -20,6 +21,7 @@ struct mychardev {
 	struct mutex lock;
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
+	void *shared_page;
 	DECLARE_KFIFO(buffer, unsigned char, BUFFER_SIZE);
 };
 
@@ -132,12 +134,31 @@ static __poll_t mychardev_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static int mychardev_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct mychardev *dev = file->private_data;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+
+	if (vma->vm_pgoff || size != PAGE_SIZE)
+		return -EINVAL;
+	if (!(vma->vm_flags & VM_SHARED))
+		return -EINVAL;
+
+	pfn = page_to_pfn(virt_to_page(dev->shared_page));
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+
+	return remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE,
+			       vma->vm_page_prot);
+}
+
 static const struct file_operations mychardev_fops = {
 	.owner = THIS_MODULE,
 	.open = mychardev_open,
 	.read = mychardev_read,
 	.write = mychardev_write,
 	.poll = mychardev_poll,
+	.mmap = mychardev_mmap,
 };
 
 static int __init mychardev_init(void)
@@ -154,9 +175,15 @@ static int __init mychardev_init(void)
 	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
 
+	my_device.shared_page = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!my_device.shared_page) {
+		ret = -ENOMEM;
+		goto unregister_region;
+	}
+
 	ret = cdev_add(&my_device.cdev, device_number, 1);
 	if (ret)
-		goto unregister_region;
+		goto free_shared_page;
 
 	device_class = class_create(CLASS_NAME);
 	if (IS_ERR(device_class)) {
@@ -179,6 +206,8 @@ destroy_class:
 	class_destroy(device_class);
 delete_cdev:
 	cdev_del(&my_device.cdev);
+free_shared_page:
+	free_page((unsigned long)my_device.shared_page);
 unregister_region:
 	unregister_chrdev_region(device_number, 1);
 	return ret;
@@ -189,6 +218,7 @@ static void __exit mychardev_exit(void)
 	device_destroy(device_class, device_number);
 	class_destroy(device_class);
 	cdev_del(&my_device.cdev);
+	free_page((unsigned long)my_device.shared_page);
 	unregister_chrdev_region(device_number, 1);
 
 	pr_info("%s: unregistered\n", DEVICE_NAME);
@@ -199,5 +229,5 @@ module_exit(mychardev_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mau");
-MODULE_DESCRIPTION("Pollable in-memory Linux character device");
-MODULE_VERSION("5.0");
+MODULE_DESCRIPTION("Memory-mapped in-memory Linux character device");
+MODULE_VERSION("6.0");

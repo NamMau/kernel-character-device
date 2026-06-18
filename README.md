@@ -12,6 +12,7 @@ The module:
 - appends writes and consumes data as it is read;
 - supports blocking and nonblocking I/O;
 - reports read and write readiness to `poll`, `select`, and `epoll`;
+- provides one shared page through `mmap`;
 - does not support seeking.
 
 ## Build and load
@@ -48,6 +49,23 @@ of sleeping when a read cannot return data or a write cannot accept data.
 Read readiness is reported while the FIFO contains data. Write readiness is
 reported while the FIFO has free space. Applications can monitor these states
 with `poll()`, `select()`, or `epoll()`.
+
+## Shared memory
+
+Applications can map one page from offset zero using `MAP_SHARED`:
+
+```c
+void *page;
+
+page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+if (page == MAP_FAILED)
+	perror("mmap");
+```
+
+Use `sysconf(_SC_PAGESIZE)` instead of assuming a 4096-byte page in production
+code. The mapping is separate from the FIFO used by `read()` and `write()`.
+Processes sharing the page must provide their own synchronization and data
+format because direct mapped-memory accesses do not enter the driver.
 
 ## Unload and clean
 
