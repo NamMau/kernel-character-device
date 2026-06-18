@@ -1,100 +1,148 @@
+// SPDX-License-Identifier: GPL-2.0
+
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/fs.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 
 #define DEVICE_NAME "mychardev"
+#define CLASS_NAME "mychardev"
 #define BUFFER_SIZE 1024
 
-static int major_number;
-static char device_buffer[BUFFER_SIZE];
-static size_t buffer_len;
-
-static int dev_open(struct inode *inodep, struct file *filep)
-{
-	pr_info("mychardev: opened\n");
-	return 0;
-}
-
-static ssize_t dev_read(struct file *filep, char __user *buffer,
-			size_t len, loff_t *offset)
-{
-	size_t bytes_to_read;
-
-	if (*offset >= buffer_len)
-		return 0;
-
-	bytes_to_read = min(len, buffer_len - (size_t)*offset);
-
-	if (copy_to_user(buffer, device_buffer + *offset, bytes_to_read))
-		return -EFAULT;
-
-	*offset += bytes_to_read;
-
-	pr_info("mychardev: read %zu bytes\n", bytes_to_read);
-
-	return bytes_to_read;
-}
-
-static ssize_t dev_write(struct file *filep, const char __user *buffer,
-			 size_t len, loff_t *offset)
-{
-	size_t bytes_to_write;
-
-	bytes_to_write = min(len, (size_t)(BUFFER_SIZE - 1));
-
-	if (copy_from_user(device_buffer, buffer, bytes_to_write))
-		return -EFAULT;
-
-	device_buffer[bytes_to_write] = '\0';
-	buffer_len = bytes_to_write;
-
-	pr_info("mychardev: wrote %zu bytes\n", bytes_to_write);
-
-	return bytes_to_write;
-}
-
-static int dev_release(struct inode *inodep, struct file *filep)
-{
-	pr_info("mychardev: released\n");
-	return 0;
-}
-
-static const struct file_operations fops = {
-	.owner = THIS_MODULE,
-	.open = dev_open,
-	.read = dev_read,
-	.write = dev_write,
-	.release = dev_release,
+struct mychardev {
+	struct cdev cdev;
+	struct mutex lock;
+	char buffer[BUFFER_SIZE];
+	size_t length;
 };
 
-static int __init char_init(void)
-{
-	major_number = register_chrdev(0, DEVICE_NAME, &fops);
+static dev_t device_number;
+static struct class *device_class;
+static struct device *device;
+static struct mychardev my_device;
 
-	if (major_number < 0) {
-		pr_err("mychardev: failed to register device\n");
-		return major_number;
+static int mychardev_open(struct inode *inode, struct file *file)
+{
+	struct mychardev *dev;
+
+	dev = container_of(inode->i_cdev, struct mychardev, cdev);
+	file->private_data = dev;
+
+	return nonseekable_open(inode, file);
+}
+
+static ssize_t mychardev_read(struct file *file, char __user *buffer,
+			      size_t count, loff_t *offset)
+{
+	struct mychardev *dev = file->private_data;
+	ssize_t ret;
+
+	if (mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+
+	ret = simple_read_from_buffer(buffer, count, offset, dev->buffer,
+				      dev->length);
+
+	mutex_unlock(&dev->lock);
+	return ret;
+}
+
+static ssize_t mychardev_write(struct file *file,
+			       const char __user *buffer, size_t count,
+			       loff_t *offset)
+{
+	struct mychardev *dev = file->private_data;
+	char *new_data;
+
+	if (count >= BUFFER_SIZE)
+		return -EMSGSIZE;
+
+	new_data = memdup_user_nul(buffer, count);
+	if (IS_ERR(new_data))
+		return PTR_ERR(new_data);
+
+	if (mutex_lock_interruptible(&dev->lock))
+		goto interrupted;
+
+	memcpy(dev->buffer, new_data, count + 1);
+	dev->length = count;
+	*offset = 0;
+
+	mutex_unlock(&dev->lock);
+	kfree(new_data);
+	return count;
+
+interrupted:
+	kfree(new_data);
+	return -ERESTARTSYS;
+}
+
+static const struct file_operations mychardev_fops = {
+	.owner = THIS_MODULE,
+	.open = mychardev_open,
+	.read = mychardev_read,
+	.write = mychardev_write,
+};
+
+static int __init mychardev_init(void)
+{
+	int ret;
+
+	ret = alloc_chrdev_region(&device_number, 0, 1, DEVICE_NAME);
+	if (ret)
+		return ret;
+
+	mutex_init(&my_device.lock);
+	cdev_init(&my_device.cdev, &mychardev_fops);
+
+	ret = cdev_add(&my_device.cdev, device_number, 1);
+	if (ret)
+		goto unregister_region;
+
+	device_class = class_create(CLASS_NAME);
+	if (IS_ERR(device_class)) {
+		ret = PTR_ERR(device_class);
+		goto delete_cdev;
 	}
 
-	pr_info("mychardev: registered with major number %d\n", major_number);
-	pr_info("mychardev: create device with: sudo mknod /dev/%s c %d 0\n",
-		DEVICE_NAME, major_number);
+	device = device_create(device_class, NULL, device_number, NULL,
+			       DEVICE_NAME);
+	if (IS_ERR(device)) {
+		ret = PTR_ERR(device);
+		goto destroy_class;
+	}
 
+	pr_info("%s: registered major=%u minor=%u\n", DEVICE_NAME,
+		MAJOR(device_number), MINOR(device_number));
 	return 0;
+
+destroy_class:
+	class_destroy(device_class);
+delete_cdev:
+	cdev_del(&my_device.cdev);
+unregister_region:
+	unregister_chrdev_region(device_number, 1);
+	return ret;
 }
 
-static void __exit char_exit(void)
+static void __exit mychardev_exit(void)
 {
-	unregister_chrdev(major_number, DEVICE_NAME);
-	pr_info("mychardev: unregistered\n");
+	device_destroy(device_class, device_number);
+	class_destroy(device_class);
+	cdev_del(&my_device.cdev);
+	unregister_chrdev_region(device_number, 1);
+
+	pr_info("%s: unregistered\n", DEVICE_NAME);
 }
 
-module_init(char_init);
-module_exit(char_exit);
+module_init(mychardev_init);
+module_exit(mychardev_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mau");
-MODULE_DESCRIPTION("Simple Linux Character Driver");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("Synchronized in-memory Linux character device");
+MODULE_VERSION("2.0");

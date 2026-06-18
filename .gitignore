@@ -1,0 +1,17 @@
+# Kernel module artifacts
+
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+
+*.cmd
+
+Module.symvers
+modules.order
+
+.*
+!.gitignore
+!.git

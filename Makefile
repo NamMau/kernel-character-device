@@ -1,7 +1,11 @@
-obj-m += mychardev.o 
+obj-m += mychardev.o
+
+.PHONY: all clean
+
+KERNEL_BUILD := /lib/modules/$(shell uname -r)/build
 
 all:
-		make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+	$(MAKE) -C $(KERNEL_BUILD) M=$(CURDIR) modules
 
 clean:
-		make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	$(MAKE) -C $(KERNEL_BUILD) M=$(CURDIR) clean
