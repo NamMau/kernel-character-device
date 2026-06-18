@@ -4,9 +4,9 @@
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/kfifo.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/slab.h>
 #include <linux/uaccess.h>
 
 #define DEVICE_NAME "mychardev"
@@ -16,8 +16,7 @@
 struct mychardev {
 	struct cdev cdev;
 	struct mutex lock;
-	char buffer[BUFFER_SIZE];
-	size_t length;
+	DECLARE_KFIFO(buffer, unsigned char, BUFFER_SIZE);
 };
 
 static dev_t device_number;
@@ -39,16 +38,19 @@ static ssize_t mychardev_read(struct file *file, char __user *buffer,
 			      size_t count, loff_t *offset)
 {
 	struct mychardev *dev = file->private_data;
-	ssize_t ret;
+	unsigned int copied;
+	int ret;
+
+	if (!count)
+		return 0;
 
 	if (mutex_lock_interruptible(&dev->lock))
 		return -ERESTARTSYS;
 
-	ret = simple_read_from_buffer(buffer, count, offset, dev->buffer,
-				      dev->length);
+	ret = kfifo_to_user(&dev->buffer, buffer, count, &copied);
 
 	mutex_unlock(&dev->lock);
-	return ret;
+	return ret ? ret : copied;
 }
 
 static ssize_t mychardev_write(struct file *file,
@@ -56,29 +58,25 @@ static ssize_t mychardev_write(struct file *file,
 			       loff_t *offset)
 {
 	struct mychardev *dev = file->private_data;
-	char *new_data;
+	unsigned int copied;
+	int ret;
 
-	if (count >= BUFFER_SIZE)
-		return -EMSGSIZE;
-
-	new_data = memdup_user_nul(buffer, count);
-	if (IS_ERR(new_data))
-		return PTR_ERR(new_data);
+	if (!count)
+		return 0;
 
 	if (mutex_lock_interruptible(&dev->lock))
-		goto interrupted;
+		return -ERESTARTSYS;
 
-	memcpy(dev->buffer, new_data, count + 1);
-	dev->length = count;
-	*offset = 0;
+	if (kfifo_is_full(&dev->buffer)) {
+		ret = -ENOSPC;
+		goto unlock;
+	}
 
+	ret = kfifo_from_user(&dev->buffer, buffer, count, &copied);
+
+unlock:
 	mutex_unlock(&dev->lock);
-	kfree(new_data);
-	return count;
-
-interrupted:
-	kfree(new_data);
-	return -ERESTARTSYS;
+	return ret ? ret : copied;
 }
 
 static const struct file_operations mychardev_fops = {
@@ -97,6 +95,7 @@ static int __init mychardev_init(void)
 		return ret;
 
 	mutex_init(&my_device.lock);
+	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
 
 	ret = cdev_add(&my_device.cdev, device_number, 1);
@@ -145,4 +144,4 @@ module_exit(mychardev_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mau");
 MODULE_DESCRIPTION("Synchronized in-memory Linux character device");
-MODULE_VERSION("2.0");
+MODULE_VERSION("3.0");

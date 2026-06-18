@@ -8,8 +8,8 @@ The module:
 - allocates its major and minor numbers dynamically;
 - creates `/dev/mychardev` through the Linux device model;
 - supports synchronized reads and writes;
-- stores one message of at most 1023 bytes;
-- replaces the previous message on every successful write;
+- stores up to 1024 bytes in a FIFO ring buffer;
+- appends writes and consumes data as it is read;
 - does not support seeking.
 
 ## Build and load
@@ -36,8 +36,10 @@ printf 'hello from userspace\n' | sudo tee /dev/mychardev >/dev/null
 sudo cat /dev/mychardev
 ```
 
-Each write replaces the stored message. A write of 1024 bytes or more fails
-with `EMSGSIZE` instead of silently truncating data.
+Writes append as much data as the ring buffer can hold. Reads consume available
+data in FIFO order. An empty read returns immediately with no data, and a write
+to a full buffer fails with `ENOSPC`. Blocking behavior will be added in a
+later phase.
 
 ## Unload and clean
 
