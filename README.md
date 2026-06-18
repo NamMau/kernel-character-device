@@ -10,6 +10,7 @@ The module:
 - supports synchronized reads and writes;
 - stores up to 1024 bytes in a FIFO ring buffer;
 - appends writes and consumes data as it is read;
+- supports blocking and nonblocking I/O;
 - does not support seeking.
 
 ## Build and load
@@ -37,9 +38,11 @@ sudo cat /dev/mychardev
 ```
 
 Writes append as much data as the ring buffer can hold. Reads consume available
-data in FIFO order. An empty read returns immediately with no data, and a write
-to a full buffer fails with `ENOSPC`. Blocking behavior will be added in a
-later phase.
+data in FIFO order. By default, reads wait while the buffer is empty and writes
+wait while it is full. A signal interrupts either wait.
+
+Applications that open the device with `O_NONBLOCK` receive `EAGAIN` instead
+of sleeping when a read cannot return data or a write cannot accept data.
 
 ## Unload and clean
 

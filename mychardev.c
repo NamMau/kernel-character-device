@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #define DEVICE_NAME "mychardev"
 #define CLASS_NAME "mychardev"
@@ -16,6 +17,8 @@
 struct mychardev {
 	struct cdev cdev;
 	struct mutex lock;
+	wait_queue_head_t read_queue;
+	wait_queue_head_t write_queue;
 	DECLARE_KFIFO(buffer, unsigned char, BUFFER_SIZE);
 };
 
@@ -38,18 +41,36 @@ static ssize_t mychardev_read(struct file *file, char __user *buffer,
 			      size_t count, loff_t *offset)
 {
 	struct mychardev *dev = file->private_data;
-	unsigned int copied;
+	unsigned int copied = 0;
 	int ret;
 
 	if (!count)
 		return 0;
 
-	if (mutex_lock_interruptible(&dev->lock))
-		return -ERESTARTSYS;
+	for (;;) {
+		if (mutex_lock_interruptible(&dev->lock))
+			return -ERESTARTSYS;
+
+		if (!kfifo_is_empty(&dev->buffer))
+			break;
+
+		mutex_unlock(&dev->lock);
+
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		ret = wait_event_interruptible(dev->read_queue,
+					       !kfifo_is_empty(&dev->buffer));
+		if (ret)
+			return ret;
+	}
 
 	ret = kfifo_to_user(&dev->buffer, buffer, count, &copied);
-
 	mutex_unlock(&dev->lock);
+
+	if (copied)
+		wake_up_interruptible(&dev->write_queue);
+
 	return ret ? ret : copied;
 }
 
@@ -58,24 +79,36 @@ static ssize_t mychardev_write(struct file *file,
 			       loff_t *offset)
 {
 	struct mychardev *dev = file->private_data;
-	unsigned int copied;
+	unsigned int copied = 0;
 	int ret;
 
 	if (!count)
 		return 0;
 
-	if (mutex_lock_interruptible(&dev->lock))
-		return -ERESTARTSYS;
+	for (;;) {
+		if (mutex_lock_interruptible(&dev->lock))
+			return -ERESTARTSYS;
 
-	if (kfifo_is_full(&dev->buffer)) {
-		ret = -ENOSPC;
-		goto unlock;
+		if (!kfifo_is_full(&dev->buffer))
+			break;
+
+		mutex_unlock(&dev->lock);
+
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		ret = wait_event_interruptible(dev->write_queue,
+					       !kfifo_is_full(&dev->buffer));
+		if (ret)
+			return ret;
 	}
 
 	ret = kfifo_from_user(&dev->buffer, buffer, count, &copied);
-
-unlock:
 	mutex_unlock(&dev->lock);
+
+	if (copied)
+		wake_up_interruptible(&dev->read_queue);
+
 	return ret ? ret : copied;
 }
 
@@ -95,6 +128,8 @@ static int __init mychardev_init(void)
 		return ret;
 
 	mutex_init(&my_device.lock);
+	init_waitqueue_head(&my_device.read_queue);
+	init_waitqueue_head(&my_device.write_queue);
 	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
 
@@ -143,5 +178,5 @@ module_exit(mychardev_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mau");
-MODULE_DESCRIPTION("Synchronized in-memory Linux character device");
-MODULE_VERSION("3.0");
+MODULE_DESCRIPTION("Blocking in-memory Linux character device");
+MODULE_VERSION("4.0");
