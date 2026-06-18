@@ -7,6 +7,7 @@
 #include <linux/kfifo.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/poll.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
@@ -112,11 +113,31 @@ static ssize_t mychardev_write(struct file *file,
 	return ret ? ret : copied;
 }
 
+static __poll_t mychardev_poll(struct file *file, poll_table *wait)
+{
+	struct mychardev *dev = file->private_data;
+	__poll_t mask = 0;
+
+	poll_wait(file, &dev->read_queue, wait);
+	poll_wait(file, &dev->write_queue, wait);
+
+	mutex_lock(&dev->lock);
+
+	if (!kfifo_is_empty(&dev->buffer))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	if (!kfifo_is_full(&dev->buffer))
+		mask |= EPOLLOUT | EPOLLWRNORM;
+
+	mutex_unlock(&dev->lock);
+	return mask;
+}
+
 static const struct file_operations mychardev_fops = {
 	.owner = THIS_MODULE,
 	.open = mychardev_open,
 	.read = mychardev_read,
 	.write = mychardev_write,
+	.poll = mychardev_poll,
 };
 
 static int __init mychardev_init(void)
@@ -178,5 +199,5 @@ module_exit(mychardev_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mau");
-MODULE_DESCRIPTION("Blocking in-memory Linux character device");
-MODULE_VERSION("4.0");
+MODULE_DESCRIPTION("Pollable in-memory Linux character device");
+MODULE_VERSION("5.0");

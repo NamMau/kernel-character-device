@@ -11,6 +11,7 @@ The module:
 - stores up to 1024 bytes in a FIFO ring buffer;
 - appends writes and consumes data as it is read;
 - supports blocking and nonblocking I/O;
+- reports read and write readiness to `poll`, `select`, and `epoll`;
 - does not support seeking.
 
 ## Build and load
@@ -43,6 +44,10 @@ wait while it is full. A signal interrupts either wait.
 
 Applications that open the device with `O_NONBLOCK` receive `EAGAIN` instead
 of sleeping when a read cannot return data or a write cannot accept data.
+
+Read readiness is reported while the FIFO contains data. Write readiness is
+reported while the FIFO has free space. Applications can monitor these states
+with `poll()`, `select()`, or `epoll()`.
 
 ## Unload and clean
 
