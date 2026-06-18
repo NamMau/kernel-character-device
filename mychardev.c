@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -9,16 +10,24 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
+#include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
 #define DEVICE_NAME "mychardev"
 #define CLASS_NAME "mychardev"
 #define BUFFER_SIZE 1024
+#define TIMER_INTERVAL_MS 1000
+
+struct mychardev_shared {
+	u64 timer_ticks;
+};
 
 struct mychardev {
 	struct cdev cdev;
 	struct mutex lock;
+	struct timer_list timer;
+	atomic64_t timer_ticks;
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
 	void *shared_page;
@@ -29,6 +38,19 @@ static dev_t device_number;
 static struct class *device_class;
 static struct device *device;
 static struct mychardev my_device;
+
+static void mychardev_timer(struct timer_list *timer)
+{
+	struct mychardev *dev = timer_container_of(dev, timer, timer);
+	struct mychardev_shared *shared = dev->shared_page;
+	s64 ticks;
+
+	ticks = atomic64_inc_return(&dev->timer_ticks);
+	WRITE_ONCE(shared->timer_ticks, ticks);
+
+	mod_timer(&dev->timer,
+		  jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
+}
 
 static int mychardev_open(struct inode *inode, struct file *file)
 {
@@ -172,6 +194,8 @@ static int __init mychardev_init(void)
 	mutex_init(&my_device.lock);
 	init_waitqueue_head(&my_device.read_queue);
 	init_waitqueue_head(&my_device.write_queue);
+	atomic64_set(&my_device.timer_ticks, 0);
+	timer_setup(&my_device.timer, mychardev_timer, 0);
 	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
 
@@ -200,6 +224,8 @@ static int __init mychardev_init(void)
 
 	pr_info("%s: registered major=%u minor=%u\n", DEVICE_NAME,
 		MAJOR(device_number), MINOR(device_number));
+	mod_timer(&my_device.timer,
+		  jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
 	return 0;
 
 destroy_class:
@@ -215,6 +241,7 @@ unregister_region:
 
 static void __exit mychardev_exit(void)
 {
+	timer_shutdown_sync(&my_device.timer);
 	device_destroy(device_class, device_number);
 	class_destroy(device_class);
 	cdev_del(&my_device.cdev);
@@ -229,5 +256,5 @@ module_exit(mychardev_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mau");
-MODULE_DESCRIPTION("Memory-mapped in-memory Linux character device");
-MODULE_VERSION("6.0");
+MODULE_DESCRIPTION("Timer-driven in-memory Linux character device");
+MODULE_VERSION("7.0");

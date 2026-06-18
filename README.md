@@ -13,6 +13,7 @@ The module:
 - supports blocking and nonblocking I/O;
 - reports read and write readiness to `poll`, `select`, and `epoll`;
 - provides one shared page through `mmap`;
+- updates a timer tick counter once per second;
 - does not support seeking.
 
 ## Build and load
@@ -66,6 +67,19 @@ Use `sysconf(_SC_PAGESIZE)` instead of assuming a 4096-byte page in production
 code. The mapping is separate from the FIFO used by `read()` and `write()`.
 Processes sharing the page must provide their own synchronization and data
 format because direct mapped-memory accesses do not enter the driver.
+
+The first 64 bits of the mapped page are reserved for a timer tick counter.
+The driver increments this counter once per second:
+
+```c
+volatile uint64_t *timer_ticks = page;
+
+printf("timer ticks: %" PRIu64 "\n", *timer_ticks);
+```
+
+Include `<inttypes.h>` and `<stdint.h>` for this example. Applications must
+treat the counter as read-only. The remaining bytes in the page are available
+for application-defined shared data.
 
 ## Unload and clean
 
