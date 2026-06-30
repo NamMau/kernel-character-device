@@ -9,6 +9,7 @@
 #include <linux/kfifo.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
 #include <linux/timer.h>
@@ -17,8 +18,9 @@
 
 #define DEVICE_NAME "mychardev"
 #define CLASS_NAME "mychardev"
-#define BUFFER_SIZE 1024
-#define TIMER_INTERVAL_MS 1000
+#define DEFAULT_BUFFER_SIZE 1024
+#define MAX_BUFFER_SIZE 1048576
+#define DEFAULT_TIMER_INTERVAL_MS 1000
 #define MIN_TIMER_INTERVAL_MS 1
 #define MAX_TIMER_INTERVAL_MS 60000
 #define MYCHARDEV_IOC_MAGIC 'm'
@@ -57,8 +59,16 @@ struct mychardev {
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
 	void *shared_page;
-	DECLARE_KFIFO(buffer, unsigned char, BUFFER_SIZE);
+	struct kfifo buffer;
 };
+
+static unsigned int buffer_size = DEFAULT_BUFFER_SIZE;
+module_param(buffer_size, uint, 0444);
+MODULE_PARM_DESC(buffer_size, "FIFO buffer size in bytes");
+
+static unsigned int timer_interval_ms = DEFAULT_TIMER_INTERVAL_MS;
+module_param(timer_interval_ms, uint, 0444);
+MODULE_PARM_DESC(timer_interval_ms, "Initial timer interval in milliseconds");
 
 static dev_t device_number;
 static struct class *device_class;
@@ -244,7 +254,7 @@ static long mychardev_ioctl(struct file *file, unsigned int cmd,
 		if (mutex_lock_interruptible(&dev->lock))
 			return -ERESTARTSYS;
 
-		info.buffer_size = BUFFER_SIZE;
+		info.buffer_size = kfifo_size(&dev->buffer);
 		info.bytes_used = kfifo_len(&dev->buffer);
 		info.bytes_free = kfifo_avail(&dev->buffer);
 		info.open_count = atomic_read(&dev->open_count);
@@ -335,6 +345,12 @@ static int __init mychardev_init(void)
 {
 	int ret;
 
+	if (!buffer_size || buffer_size > MAX_BUFFER_SIZE)
+		return -EINVAL;
+	if (timer_interval_ms < MIN_TIMER_INTERVAL_MS ||
+	    timer_interval_ms > MAX_TIMER_INTERVAL_MS)
+		return -EINVAL;
+
 	ret = alloc_chrdev_region(&device_number, 0, 1, DEVICE_NAME);
 	if (ret)
 		return ret;
@@ -345,15 +361,18 @@ static int __init mychardev_init(void)
 	atomic64_set(&my_device.timer_ticks, 0);
 	atomic_set(&my_device.open_count, 0);
 	atomic_set(&my_device.mmap_count, 0);
-	my_device.timer_interval_ms = TIMER_INTERVAL_MS;
+	my_device.timer_interval_ms = timer_interval_ms;
 	timer_setup(&my_device.timer, mychardev_timer, 0);
-	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
+
+	ret = kfifo_alloc(&my_device.buffer, buffer_size, GFP_KERNEL);
+	if (ret)
+		goto unregister_region;
 
 	my_device.shared_page = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!my_device.shared_page) {
 		ret = -ENOMEM;
-		goto unregister_region;
+		goto free_fifo;
 	}
 
 	ret = cdev_add(&my_device.cdev, device_number, 1);
@@ -386,6 +405,8 @@ delete_cdev:
 	cdev_del(&my_device.cdev);
 free_shared_page:
 	free_page((unsigned long)my_device.shared_page);
+free_fifo:
+	kfifo_free(&my_device.buffer);
 unregister_region:
 	unregister_chrdev_region(device_number, 1);
 	return ret;
@@ -398,6 +419,7 @@ static void __exit mychardev_exit(void)
 	class_destroy(device_class);
 	cdev_del(&my_device.cdev);
 	free_page((unsigned long)my_device.shared_page);
+	kfifo_free(&my_device.buffer);
 	unregister_chrdev_region(device_number, 1);
 
 	pr_info("%s: unregistered\n", DEVICE_NAME);

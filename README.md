@@ -8,7 +8,7 @@ The module:
 - allocates its major and minor numbers dynamically;
 - creates `/dev/mychardev` through the Linux device model;
 - supports synchronized reads and writes;
-- stores up to 1024 bytes in a FIFO ring buffer;
+- stores data in a configurable FIFO ring buffer;
 - appends writes and consumes data as it is read;
 - supports blocking and nonblocking I/O;
 - reports read and write readiness to `poll`, `select`, and `epoll`;
@@ -30,6 +30,19 @@ sudo dmesg | tail
 
 The device node should be created automatically by `udev`. No manual `mknod`
 command is required.
+
+The FIFO size and initial timer interval can be set when loading the module:
+
+```sh
+sudo insmod mychardev.ko buffer_size=4096 timer_interval_ms=500
+```
+
+`buffer_size` is expressed in bytes and must be between 1 and 1048576.
+The default is 1024. Use `MYCHARDEV_IOC_GET_INFO` to read the active FIFO
+capacity reported by the driver.
+
+The initial `timer_interval_ms` value must be between 1 and 60000. The default
+is 1000. The timer interval can also be changed later with `ioctl()`.
 
 ## Test
 
