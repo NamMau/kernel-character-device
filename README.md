@@ -13,7 +13,7 @@ The module:
 - supports blocking and nonblocking I/O;
 - reports read and write readiness to `poll`, `select`, and `epoll`;
 - supports `ioctl` controls for status, FIFO reset, and timer settings;
-- provides one shared page through `mmap`;
+- provides a versioned status page through `mmap`;
 - updates a timer tick counter once per second;
 - does not support seeking.
 
@@ -123,22 +123,44 @@ if (page == MAP_FAILED)
 ```
 
 Use `sysconf(_SC_PAGESIZE)` instead of assuming a 4096-byte page in production
-code. The mapping is separate from the FIFO used by `read()` and `write()`.
-Processes sharing the page must provide their own synchronization and data
-format because direct mapped-memory accesses do not enter the driver.
+code. The mapping is a read-only status protocol from the driver's point of
+view. Applications must not write to fields in the mapped page.
 
-The first 64 bits of the mapped page are reserved for a timer tick counter.
-The driver increments this counter once per second:
+The mapped page starts with this versioned structure:
 
 ```c
-volatile uint64_t *timer_ticks = page;
-
-printf("timer ticks: %" PRIu64 "\n", *timer_ticks);
+struct mychardev_shared {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t struct_size;
+	uint32_t sequence;
+	uint32_t minor;
+	uint32_t buffer_size;
+	uint32_t bytes_used;
+	uint32_t bytes_free;
+	uint32_t open_count;
+	uint32_t mmap_count;
+	uint32_t timer_interval_ms;
+	uint32_t flags;
+	uint64_t timer_ticks;
+	uint64_t last_update_ns;
+	uint64_t reserved[4];
+};
 ```
 
-Include `<inttypes.h>` and `<stdint.h>` for this example. Applications must
-treat the counter as read-only. The remaining bytes in the page are available
-for application-defined shared data.
+`magic` is `0x4d434844`, `version` is `1`, and `struct_size` is the size of
+the structure above. `sequence` is odd while the driver is updating the shared
+page and even when a snapshot is complete. Userspace should read `sequence`,
+copy the fields, then read `sequence` again and retry if either value is odd or
+the values differ.
+
+`flags` uses bit 0 for readable FIFO state and bit 1 for writable FIFO state.
+`last_update_ns` is a monotonic timestamp from the kernel.
+
+The driver refreshes this status after open, close, read, write, FIFO clear,
+timer reset, timer interval changes, mmap lifetime changes, and timer ticks.
+Direct mapped-memory accesses do not enter the driver, so the mapped page is
+for observing driver-owned state rather than exchanging application data.
 
 ## Unload and clean
 

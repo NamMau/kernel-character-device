@@ -7,12 +7,14 @@
 #include <linux/init.h>
 #include <linux/ioctl.h>
 #include <linux/kfifo.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
@@ -26,6 +28,10 @@
 #define DEFAULT_TIMER_INTERVAL_MS 1000
 #define MIN_TIMER_INTERVAL_MS 1
 #define MAX_TIMER_INTERVAL_MS 60000
+#define MYCHARDEV_SHARED_MAGIC 0x4d434844
+#define MYCHARDEV_SHARED_VERSION 1
+#define MYCHARDEV_SHARED_F_READABLE (1U << 0)
+#define MYCHARDEV_SHARED_F_WRITABLE (1U << 1)
 #define MYCHARDEV_IOC_MAGIC 'm'
 #define MYCHARDEV_IOC_CLEAR _IO(MYCHARDEV_IOC_MAGIC, 0)
 #define MYCHARDEV_IOC_GET_INFO \
@@ -48,19 +54,35 @@ struct mychardev_info {
 };
 
 struct mychardev_shared {
-	u64 timer_ticks;
+	__u32 magic;
+	__u16 version;
+	__u16 struct_size;
+	__u32 sequence;
+	__u32 minor;
+	__u32 buffer_size;
+	__u32 bytes_used;
+	__u32 bytes_free;
+	__u32 open_count;
+	__u32 mmap_count;
+	__u32 timer_interval_ms;
+	__u32 flags;
+	__u64 timer_ticks;
+	__u64 last_update_ns;
+	__u64 reserved[4];
 };
 
 struct mychardev {
 	struct cdev cdev;
 	struct device *device;
 	struct mutex lock;
+	spinlock_t shared_lock;
 	struct timer_list timer;
 	atomic64_t timer_ticks;
 	atomic_t open_count;
 	atomic_t mmap_count;
 	unsigned int minor;
 	unsigned int timer_interval_ms;
+	unsigned int shared_sequence;
 	bool cdev_added;
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
@@ -84,12 +106,56 @@ static dev_t device_number;
 static struct class *device_class;
 static struct mychardev *devices;
 
+static void mychardev_update_shared_locked(struct mychardev *dev)
+{
+	struct mychardev_shared *shared = dev->shared_page;
+	unsigned long irq_flags;
+	__u32 bytes_used;
+	__u32 bytes_free;
+	__u32 flags = 0;
+
+	if (!shared)
+		return;
+
+	bytes_used = kfifo_len(&dev->buffer);
+	bytes_free = kfifo_avail(&dev->buffer);
+
+	if (bytes_used)
+		flags |= MYCHARDEV_SHARED_F_READABLE;
+	if (bytes_free)
+		flags |= MYCHARDEV_SHARED_F_WRITABLE;
+
+	spin_lock_irqsave(&dev->shared_lock, irq_flags);
+	WRITE_ONCE(shared->sequence, ++dev->shared_sequence);
+	smp_wmb();
+	WRITE_ONCE(shared->magic, MYCHARDEV_SHARED_MAGIC);
+	WRITE_ONCE(shared->version, MYCHARDEV_SHARED_VERSION);
+	WRITE_ONCE(shared->struct_size, sizeof(*shared));
+	WRITE_ONCE(shared->minor, dev->minor);
+	WRITE_ONCE(shared->buffer_size, kfifo_size(&dev->buffer));
+	WRITE_ONCE(shared->bytes_used, bytes_used);
+	WRITE_ONCE(shared->bytes_free, bytes_free);
+	WRITE_ONCE(shared->open_count, atomic_read(&dev->open_count));
+	WRITE_ONCE(shared->mmap_count, atomic_read(&dev->mmap_count));
+	WRITE_ONCE(shared->timer_interval_ms,
+		   READ_ONCE(dev->timer_interval_ms));
+	WRITE_ONCE(shared->flags, flags);
+	WRITE_ONCE(shared->timer_ticks, atomic64_read(&dev->timer_ticks));
+	WRITE_ONCE(shared->last_update_ns, ktime_get_ns());
+	smp_wmb();
+	WRITE_ONCE(shared->sequence, ++dev->shared_sequence);
+	spin_unlock_irqrestore(&dev->shared_lock, irq_flags);
+}
+
 static void mychardev_vma_open(struct vm_area_struct *vma)
 {
 	struct mychardev *dev = vma->vm_private_data;
 
 	__module_get(THIS_MODULE);
 	atomic_inc(&dev->mmap_count);
+	mutex_lock(&dev->lock);
+	mychardev_update_shared_locked(dev);
+	mutex_unlock(&dev->lock);
 }
 
 static void mychardev_vma_close(struct vm_area_struct *vma)
@@ -97,6 +163,9 @@ static void mychardev_vma_close(struct vm_area_struct *vma)
 	struct mychardev *dev = vma->vm_private_data;
 
 	atomic_dec(&dev->mmap_count);
+	mutex_lock(&dev->lock);
+	mychardev_update_shared_locked(dev);
+	mutex_unlock(&dev->lock);
 	module_put(THIS_MODULE);
 }
 
@@ -109,10 +178,21 @@ static void mychardev_timer(struct timer_list *timer)
 {
 	struct mychardev *dev = timer_container_of(dev, timer, timer);
 	struct mychardev_shared *shared = dev->shared_page;
+	unsigned long irq_flags;
 	s64 ticks;
 
 	ticks = atomic64_inc_return(&dev->timer_ticks);
+
+	spin_lock_irqsave(&dev->shared_lock, irq_flags);
+	WRITE_ONCE(shared->sequence, ++dev->shared_sequence);
+	smp_wmb();
 	WRITE_ONCE(shared->timer_ticks, ticks);
+	WRITE_ONCE(shared->timer_interval_ms,
+		   READ_ONCE(dev->timer_interval_ms));
+	WRITE_ONCE(shared->last_update_ns, ktime_get_ns());
+	smp_wmb();
+	WRITE_ONCE(shared->sequence, ++dev->shared_sequence);
+	spin_unlock_irqrestore(&dev->shared_lock, irq_flags);
 
 	mod_timer(&dev->timer,
 		  jiffies +
@@ -132,6 +212,9 @@ static int mychardev_open(struct inode *inode, struct file *file)
 
 	file->private_data = dev;
 	atomic_inc(&dev->open_count);
+	mutex_lock(&dev->lock);
+	mychardev_update_shared_locked(dev);
+	mutex_unlock(&dev->lock);
 
 	return 0;
 }
@@ -142,6 +225,11 @@ static int mychardev_release(struct inode *inode, struct file *file)
 
 	if (dev)
 		atomic_dec(&dev->open_count);
+	if (dev) {
+		mutex_lock(&dev->lock);
+		mychardev_update_shared_locked(dev);
+		mutex_unlock(&dev->lock);
+	}
 
 	file->private_data = NULL;
 	return 0;
@@ -176,6 +264,7 @@ static ssize_t mychardev_read(struct file *file, char __user *buffer,
 	}
 
 	ret = kfifo_to_user(&dev->buffer, buffer, count, &copied);
+	mychardev_update_shared_locked(dev);
 	mutex_unlock(&dev->lock);
 
 	if (copied)
@@ -214,6 +303,7 @@ static ssize_t mychardev_write(struct file *file,
 	}
 
 	ret = kfifo_from_user(&dev->buffer, buffer, count, &copied);
+	mychardev_update_shared_locked(dev);
 	mutex_unlock(&dev->lock);
 
 	if (copied)
@@ -245,7 +335,6 @@ static long mychardev_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
 	struct mychardev *dev = file->private_data;
-	struct mychardev_shared *shared = dev->shared_page;
 	struct mychardev_info info;
 	__u32 interval;
 
@@ -255,6 +344,7 @@ static long mychardev_ioctl(struct file *file, unsigned int cmd,
 			return -ERESTARTSYS;
 
 		kfifo_reset(&dev->buffer);
+		mychardev_update_shared_locked(dev);
 		mutex_unlock(&dev->lock);
 		wake_up_interruptible(&dev->write_queue);
 		return 0;
@@ -279,7 +369,9 @@ static long mychardev_ioctl(struct file *file, unsigned int cmd,
 
 	case MYCHARDEV_IOC_RESET_TIMER:
 		atomic64_set(&dev->timer_ticks, 0);
-		WRITE_ONCE(shared->timer_ticks, 0);
+		mutex_lock(&dev->lock);
+		mychardev_update_shared_locked(dev);
+		mutex_unlock(&dev->lock);
 		return 0;
 
 	case MYCHARDEV_IOC_GET_TIMER_INTERVAL:
@@ -298,6 +390,9 @@ static long mychardev_ioctl(struct file *file, unsigned int cmd,
 			return -EINVAL;
 
 		WRITE_ONCE(dev->timer_interval_ms, interval);
+		mutex_lock(&dev->lock);
+		mychardev_update_shared_locked(dev);
+		mutex_unlock(&dev->lock);
 		mod_timer(&dev->timer,
 			  jiffies + msecs_to_jiffies(interval));
 		return 0;
@@ -336,6 +431,9 @@ static int mychardev_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	atomic_inc(&dev->mmap_count);
+	mutex_lock(&dev->lock);
+	mychardev_update_shared_locked(dev);
+	mutex_unlock(&dev->lock);
 	return 0;
 }
 
@@ -356,12 +454,14 @@ static int mychardev_setup_device(struct mychardev *dev, unsigned int minor)
 
 	dev->minor = minor;
 	mutex_init(&dev->lock);
+	spin_lock_init(&dev->shared_lock);
 	init_waitqueue_head(&dev->read_queue);
 	init_waitqueue_head(&dev->write_queue);
 	atomic64_set(&dev->timer_ticks, 0);
 	atomic_set(&dev->open_count, 0);
 	atomic_set(&dev->mmap_count, 0);
 	dev->timer_interval_ms = timer_interval_ms;
+	dev->shared_sequence = 0;
 	timer_setup(&dev->timer, mychardev_timer, 0);
 	cdev_init(&dev->cdev, &mychardev_fops);
 
@@ -374,6 +474,9 @@ static int mychardev_setup_device(struct mychardev *dev, unsigned int minor)
 		ret = -ENOMEM;
 		goto free_fifo;
 	}
+	mutex_lock(&dev->lock);
+	mychardev_update_shared_locked(dev);
+	mutex_unlock(&dev->lock);
 
 	ret = cdev_add(&dev->cdev, device_number + minor, 1);
 	if (ret)
