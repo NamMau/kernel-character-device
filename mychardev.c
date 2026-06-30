@@ -5,6 +5,7 @@
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/ioctl.h>
 #include <linux/kfifo.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -18,6 +19,28 @@
 #define CLASS_NAME "mychardev"
 #define BUFFER_SIZE 1024
 #define TIMER_INTERVAL_MS 1000
+#define MIN_TIMER_INTERVAL_MS 1
+#define MAX_TIMER_INTERVAL_MS 60000
+#define MYCHARDEV_IOC_MAGIC 'm'
+#define MYCHARDEV_IOC_CLEAR _IO(MYCHARDEV_IOC_MAGIC, 0)
+#define MYCHARDEV_IOC_GET_INFO \
+	_IOR(MYCHARDEV_IOC_MAGIC, 1, struct mychardev_info)
+#define MYCHARDEV_IOC_RESET_TIMER _IO(MYCHARDEV_IOC_MAGIC, 2)
+#define MYCHARDEV_IOC_GET_TIMER_INTERVAL \
+	_IOR(MYCHARDEV_IOC_MAGIC, 3, __u32)
+#define MYCHARDEV_IOC_SET_TIMER_INTERVAL \
+	_IOW(MYCHARDEV_IOC_MAGIC, 4, __u32)
+
+struct mychardev_info {
+	__u32 buffer_size;
+	__u32 bytes_used;
+	__u32 bytes_free;
+	__u32 open_count;
+	__u32 mmap_count;
+	__u32 timer_interval_ms;
+	__u32 reserved;
+	__u64 timer_ticks;
+};
 
 struct mychardev_shared {
 	u64 timer_ticks;
@@ -30,6 +53,7 @@ struct mychardev {
 	atomic64_t timer_ticks;
 	atomic_t open_count;
 	atomic_t mmap_count;
+	unsigned int timer_interval_ms;
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
 	void *shared_page;
@@ -72,7 +96,8 @@ static void mychardev_timer(struct timer_list *timer)
 	WRITE_ONCE(shared->timer_ticks, ticks);
 
 	mod_timer(&dev->timer,
-		  jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
+		  jiffies +
+		  msecs_to_jiffies(READ_ONCE(dev->timer_interval_ms)));
 }
 
 static int mychardev_open(struct inode *inode, struct file *file)
@@ -197,6 +222,72 @@ static __poll_t mychardev_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static long mychardev_ioctl(struct file *file, unsigned int cmd,
+			    unsigned long arg)
+{
+	struct mychardev *dev = file->private_data;
+	struct mychardev_shared *shared = dev->shared_page;
+	struct mychardev_info info;
+	__u32 interval;
+
+	switch (cmd) {
+	case MYCHARDEV_IOC_CLEAR:
+		if (mutex_lock_interruptible(&dev->lock))
+			return -ERESTARTSYS;
+
+		kfifo_reset(&dev->buffer);
+		mutex_unlock(&dev->lock);
+		wake_up_interruptible(&dev->write_queue);
+		return 0;
+
+	case MYCHARDEV_IOC_GET_INFO:
+		if (mutex_lock_interruptible(&dev->lock))
+			return -ERESTARTSYS;
+
+		info.buffer_size = BUFFER_SIZE;
+		info.bytes_used = kfifo_len(&dev->buffer);
+		info.bytes_free = kfifo_avail(&dev->buffer);
+		info.open_count = atomic_read(&dev->open_count);
+		info.mmap_count = atomic_read(&dev->mmap_count);
+		info.timer_interval_ms = READ_ONCE(dev->timer_interval_ms);
+		info.reserved = 0;
+		info.timer_ticks = atomic64_read(&dev->timer_ticks);
+		mutex_unlock(&dev->lock);
+
+		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
+
+	case MYCHARDEV_IOC_RESET_TIMER:
+		atomic64_set(&dev->timer_ticks, 0);
+		WRITE_ONCE(shared->timer_ticks, 0);
+		return 0;
+
+	case MYCHARDEV_IOC_GET_TIMER_INTERVAL:
+		interval = READ_ONCE(dev->timer_interval_ms);
+		if (copy_to_user((void __user *)arg, &interval,
+				 sizeof(interval)))
+			return -EFAULT;
+		return 0;
+
+	case MYCHARDEV_IOC_SET_TIMER_INTERVAL:
+		if (copy_from_user(&interval, (void __user *)arg,
+				   sizeof(interval)))
+			return -EFAULT;
+		if (interval < MIN_TIMER_INTERVAL_MS ||
+		    interval > MAX_TIMER_INTERVAL_MS)
+			return -EINVAL;
+
+		WRITE_ONCE(dev->timer_interval_ms, interval);
+		mod_timer(&dev->timer,
+			  jiffies + msecs_to_jiffies(interval));
+		return 0;
+
+	default:
+		return -ENOTTY;
+	}
+}
+
 static int mychardev_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct mychardev *dev = file->private_data;
@@ -236,6 +327,7 @@ static const struct file_operations mychardev_fops = {
 	.read = mychardev_read,
 	.write = mychardev_write,
 	.poll = mychardev_poll,
+	.unlocked_ioctl = mychardev_ioctl,
 	.mmap = mychardev_mmap,
 };
 
@@ -253,6 +345,7 @@ static int __init mychardev_init(void)
 	atomic64_set(&my_device.timer_ticks, 0);
 	atomic_set(&my_device.open_count, 0);
 	atomic_set(&my_device.mmap_count, 0);
+	my_device.timer_interval_ms = TIMER_INTERVAL_MS;
 	timer_setup(&my_device.timer, mychardev_timer, 0);
 	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
@@ -283,7 +376,8 @@ static int __init mychardev_init(void)
 	pr_info("%s: registered major=%u minor=%u\n", DEVICE_NAME,
 		MAJOR(device_number), MINOR(device_number));
 	mod_timer(&my_device.timer,
-		  jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
+		  jiffies +
+		  msecs_to_jiffies(my_device.timer_interval_ms));
 	return 0;
 
 destroy_class:

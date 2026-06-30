@@ -12,6 +12,7 @@ The module:
 - appends writes and consumes data as it is read;
 - supports blocking and nonblocking I/O;
 - reports read and write readiness to `poll`, `select`, and `epoll`;
+- supports `ioctl` controls for status, FIFO reset, and timer settings;
 - provides one shared page through `mmap`;
 - updates a timer tick counter once per second;
 - does not support seeking.
@@ -50,6 +51,39 @@ of sleeping when a read cannot return data or a write cannot accept data.
 Read readiness is reported while the FIFO contains data. Write readiness is
 reported while the FIFO has free space. Applications can monitor these states
 with `poll()`, `select()`, or `epoll()`.
+
+## Device controls
+
+The driver accepts these `ioctl()` commands:
+
+```c
+#define MYCHARDEV_IOC_MAGIC 'm'
+#define MYCHARDEV_IOC_CLEAR _IO(MYCHARDEV_IOC_MAGIC, 0)
+#define MYCHARDEV_IOC_GET_INFO _IOR(MYCHARDEV_IOC_MAGIC, 1, struct mychardev_info)
+#define MYCHARDEV_IOC_RESET_TIMER _IO(MYCHARDEV_IOC_MAGIC, 2)
+#define MYCHARDEV_IOC_GET_TIMER_INTERVAL _IOR(MYCHARDEV_IOC_MAGIC, 3, uint32_t)
+#define MYCHARDEV_IOC_SET_TIMER_INTERVAL _IOW(MYCHARDEV_IOC_MAGIC, 4, uint32_t)
+```
+
+`MYCHARDEV_IOC_CLEAR` empties the FIFO and wakes blocked writers.
+`MYCHARDEV_IOC_RESET_TIMER` sets the timer tick counter back to zero.
+The timer interval is expressed in milliseconds and must be between 1 and
+60000.
+
+`MYCHARDEV_IOC_GET_INFO` copies this fixed-size status structure to userspace:
+
+```c
+struct mychardev_info {
+	uint32_t buffer_size;
+	uint32_t bytes_used;
+	uint32_t bytes_free;
+	uint32_t open_count;
+	uint32_t mmap_count;
+	uint32_t timer_interval_ms;
+	uint32_t reserved;
+	uint64_t timer_ticks;
+};
+```
 
 ## Shared memory
 
