@@ -28,6 +28,8 @@ struct mychardev {
 	struct mutex lock;
 	struct timer_list timer;
 	atomic64_t timer_ticks;
+	atomic_t open_count;
+	atomic_t mmap_count;
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
 	void *shared_page;
@@ -38,6 +40,27 @@ static dev_t device_number;
 static struct class *device_class;
 static struct device *device;
 static struct mychardev my_device;
+
+static void mychardev_vma_open(struct vm_area_struct *vma)
+{
+	struct mychardev *dev = vma->vm_private_data;
+
+	__module_get(THIS_MODULE);
+	atomic_inc(&dev->mmap_count);
+}
+
+static void mychardev_vma_close(struct vm_area_struct *vma)
+{
+	struct mychardev *dev = vma->vm_private_data;
+
+	atomic_dec(&dev->mmap_count);
+	module_put(THIS_MODULE);
+}
+
+static const struct vm_operations_struct mychardev_vm_ops = {
+	.open = mychardev_vma_open,
+	.close = mychardev_vma_close,
+};
 
 static void mychardev_timer(struct timer_list *timer)
 {
@@ -55,11 +78,29 @@ static void mychardev_timer(struct timer_list *timer)
 static int mychardev_open(struct inode *inode, struct file *file)
 {
 	struct mychardev *dev;
+	int ret;
 
 	dev = container_of(inode->i_cdev, struct mychardev, cdev);
-	file->private_data = dev;
 
-	return nonseekable_open(inode, file);
+	ret = nonseekable_open(inode, file);
+	if (ret)
+		return ret;
+
+	file->private_data = dev;
+	atomic_inc(&dev->open_count);
+
+	return 0;
+}
+
+static int mychardev_release(struct inode *inode, struct file *file)
+{
+	struct mychardev *dev = file->private_data;
+
+	if (dev)
+		atomic_dec(&dev->open_count);
+
+	file->private_data = NULL;
+	return 0;
 }
 
 static ssize_t mychardev_read(struct file *file, char __user *buffer,
@@ -161,22 +202,37 @@ static int mychardev_mmap(struct file *file, struct vm_area_struct *vma)
 	struct mychardev *dev = file->private_data;
 	unsigned long size = vma->vm_end - vma->vm_start;
 	unsigned long pfn;
+	int ret;
 
 	if (vma->vm_pgoff || size != PAGE_SIZE)
 		return -EINVAL;
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
 
+	vma->vm_private_data = dev;
+	vma->vm_ops = &mychardev_vm_ops;
 	pfn = page_to_pfn(virt_to_page(dev->shared_page));
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
-	return remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE,
-			       vma->vm_page_prot);
+	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE,
+			      vma->vm_page_prot);
+	if (ret) {
+		vma->vm_private_data = NULL;
+		vma->vm_ops = NULL;
+		module_put(THIS_MODULE);
+		return ret;
+	}
+
+	atomic_inc(&dev->mmap_count);
+	return 0;
 }
 
 static const struct file_operations mychardev_fops = {
 	.owner = THIS_MODULE,
 	.open = mychardev_open,
+	.release = mychardev_release,
 	.read = mychardev_read,
 	.write = mychardev_write,
 	.poll = mychardev_poll,
@@ -195,6 +251,8 @@ static int __init mychardev_init(void)
 	init_waitqueue_head(&my_device.read_queue);
 	init_waitqueue_head(&my_device.write_queue);
 	atomic64_set(&my_device.timer_ticks, 0);
+	atomic_set(&my_device.open_count, 0);
+	atomic_set(&my_device.mmap_count, 0);
 	timer_setup(&my_device.timer, mychardev_timer, 0);
 	INIT_KFIFO(my_device.buffer);
 	cdev_init(&my_device.cdev, &mychardev_fops);
