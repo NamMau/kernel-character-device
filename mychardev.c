@@ -12,12 +12,15 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
+#include <linux/slab.h>
 #include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
 #define DEVICE_NAME "mychardev"
 #define CLASS_NAME "mychardev"
+#define DEFAULT_DEVICE_COUNT 1
+#define MAX_DEVICE_COUNT 64
 #define DEFAULT_BUFFER_SIZE 1024
 #define MAX_BUFFER_SIZE 1048576
 #define DEFAULT_TIMER_INTERVAL_MS 1000
@@ -50,17 +53,24 @@ struct mychardev_shared {
 
 struct mychardev {
 	struct cdev cdev;
+	struct device *device;
 	struct mutex lock;
 	struct timer_list timer;
 	atomic64_t timer_ticks;
 	atomic_t open_count;
 	atomic_t mmap_count;
+	unsigned int minor;
 	unsigned int timer_interval_ms;
+	bool cdev_added;
 	wait_queue_head_t read_queue;
 	wait_queue_head_t write_queue;
 	void *shared_page;
 	struct kfifo buffer;
 };
+
+static unsigned int device_count = DEFAULT_DEVICE_COUNT;
+module_param(device_count, uint, 0444);
+MODULE_PARM_DESC(device_count, "Number of character devices to create");
 
 static unsigned int buffer_size = DEFAULT_BUFFER_SIZE;
 module_param(buffer_size, uint, 0444);
@@ -72,8 +82,7 @@ MODULE_PARM_DESC(timer_interval_ms, "Initial timer interval in milliseconds");
 
 static dev_t device_number;
 static struct class *device_class;
-static struct device *device;
-static struct mychardev my_device;
+static struct mychardev *devices;
 
 static void mychardev_vma_open(struct vm_area_struct *vma)
 {
@@ -341,86 +350,151 @@ static const struct file_operations mychardev_fops = {
 	.mmap = mychardev_mmap,
 };
 
-static int __init mychardev_init(void)
+static int mychardev_setup_device(struct mychardev *dev, unsigned int minor)
 {
 	int ret;
 
+	dev->minor = minor;
+	mutex_init(&dev->lock);
+	init_waitqueue_head(&dev->read_queue);
+	init_waitqueue_head(&dev->write_queue);
+	atomic64_set(&dev->timer_ticks, 0);
+	atomic_set(&dev->open_count, 0);
+	atomic_set(&dev->mmap_count, 0);
+	dev->timer_interval_ms = timer_interval_ms;
+	timer_setup(&dev->timer, mychardev_timer, 0);
+	cdev_init(&dev->cdev, &mychardev_fops);
+
+	ret = kfifo_alloc(&dev->buffer, buffer_size, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	dev->shared_page = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!dev->shared_page) {
+		ret = -ENOMEM;
+		goto free_fifo;
+	}
+
+	ret = cdev_add(&dev->cdev, device_number + minor, 1);
+	if (ret)
+		goto free_shared_page;
+	dev->cdev_added = true;
+
+	if (device_count == 1)
+		dev->device = device_create(device_class, NULL,
+					    device_number + minor, NULL,
+					    DEVICE_NAME);
+	else
+		dev->device = device_create(device_class, NULL,
+					    device_number + minor, NULL,
+					    "%s%u", DEVICE_NAME, minor);
+	if (IS_ERR(dev->device)) {
+		ret = PTR_ERR(dev->device);
+		dev->device = NULL;
+		goto delete_cdev;
+	}
+
+	mod_timer(&dev->timer,
+		  jiffies +
+		  msecs_to_jiffies(dev->timer_interval_ms));
+	return 0;
+
+delete_cdev:
+	cdev_del(&dev->cdev);
+	dev->cdev_added = false;
+free_shared_page:
+	free_page((unsigned long)dev->shared_page);
+	dev->shared_page = NULL;
+free_fifo:
+	kfifo_free(&dev->buffer);
+	return ret;
+}
+
+static void mychardev_destroy_device(struct mychardev *dev)
+{
+	timer_shutdown_sync(&dev->timer);
+
+	if (dev->device) {
+		device_destroy(device_class, device_number + dev->minor);
+		dev->device = NULL;
+	}
+
+	if (dev->cdev_added) {
+		cdev_del(&dev->cdev);
+		dev->cdev_added = false;
+	}
+
+	if (dev->shared_page) {
+		free_page((unsigned long)dev->shared_page);
+		dev->shared_page = NULL;
+	}
+
+	kfifo_free(&dev->buffer);
+}
+
+static int __init mychardev_init(void)
+{
+	unsigned int i;
+	int ret;
+
+	if (!device_count || device_count > MAX_DEVICE_COUNT)
+		return -EINVAL;
 	if (!buffer_size || buffer_size > MAX_BUFFER_SIZE)
 		return -EINVAL;
 	if (timer_interval_ms < MIN_TIMER_INTERVAL_MS ||
 	    timer_interval_ms > MAX_TIMER_INTERVAL_MS)
 		return -EINVAL;
 
-	ret = alloc_chrdev_region(&device_number, 0, 1, DEVICE_NAME);
+	ret = alloc_chrdev_region(&device_number, 0, device_count, DEVICE_NAME);
 	if (ret)
 		return ret;
 
-	mutex_init(&my_device.lock);
-	init_waitqueue_head(&my_device.read_queue);
-	init_waitqueue_head(&my_device.write_queue);
-	atomic64_set(&my_device.timer_ticks, 0);
-	atomic_set(&my_device.open_count, 0);
-	atomic_set(&my_device.mmap_count, 0);
-	my_device.timer_interval_ms = timer_interval_ms;
-	timer_setup(&my_device.timer, mychardev_timer, 0);
-	cdev_init(&my_device.cdev, &mychardev_fops);
-
-	ret = kfifo_alloc(&my_device.buffer, buffer_size, GFP_KERNEL);
-	if (ret)
-		goto unregister_region;
-
-	my_device.shared_page = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!my_device.shared_page) {
+	devices = kcalloc(device_count, sizeof(*devices), GFP_KERNEL);
+	if (!devices) {
 		ret = -ENOMEM;
-		goto free_fifo;
+		goto unregister_region;
 	}
-
-	ret = cdev_add(&my_device.cdev, device_number, 1);
-	if (ret)
-		goto free_shared_page;
 
 	device_class = class_create(CLASS_NAME);
 	if (IS_ERR(device_class)) {
 		ret = PTR_ERR(device_class);
-		goto delete_cdev;
+		device_class = NULL;
+		goto free_devices;
 	}
 
-	device = device_create(device_class, NULL, device_number, NULL,
-			       DEVICE_NAME);
-	if (IS_ERR(device)) {
-		ret = PTR_ERR(device);
-		goto destroy_class;
+	for (i = 0; i < device_count; i++) {
+		ret = mychardev_setup_device(&devices[i], i);
+		if (ret)
+			goto destroy_devices;
 	}
 
-	pr_info("%s: registered major=%u minor=%u\n", DEVICE_NAME,
-		MAJOR(device_number), MINOR(device_number));
-	mod_timer(&my_device.timer,
-		  jiffies +
-		  msecs_to_jiffies(my_device.timer_interval_ms));
+	pr_info("%s: registered major=%u count=%u\n", DEVICE_NAME,
+		MAJOR(device_number), device_count);
 	return 0;
 
-destroy_class:
+destroy_devices:
+	while (i--)
+		mychardev_destroy_device(&devices[i]);
 	class_destroy(device_class);
-delete_cdev:
-	cdev_del(&my_device.cdev);
-free_shared_page:
-	free_page((unsigned long)my_device.shared_page);
-free_fifo:
-	kfifo_free(&my_device.buffer);
+	device_class = NULL;
+free_devices:
+	kfree(devices);
+	devices = NULL;
 unregister_region:
-	unregister_chrdev_region(device_number, 1);
+	unregister_chrdev_region(device_number, device_count);
 	return ret;
 }
 
 static void __exit mychardev_exit(void)
 {
-	timer_shutdown_sync(&my_device.timer);
-	device_destroy(device_class, device_number);
+	unsigned int i;
+
+	for (i = 0; i < device_count; i++)
+		mychardev_destroy_device(&devices[i]);
+
 	class_destroy(device_class);
-	cdev_del(&my_device.cdev);
-	free_page((unsigned long)my_device.shared_page);
-	kfifo_free(&my_device.buffer);
-	unregister_chrdev_region(device_number, 1);
+	kfree(devices);
+	unregister_chrdev_region(device_number, device_count);
 
 	pr_info("%s: unregistered\n", DEVICE_NAME);
 }

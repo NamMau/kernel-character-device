@@ -6,7 +6,7 @@ userspace/kernel data transfer.
 The module:
 
 - allocates its major and minor numbers dynamically;
-- creates `/dev/mychardev` through the Linux device model;
+- creates one or more device nodes through the Linux device model;
 - supports synchronized reads and writes;
 - stores data in a configurable FIFO ring buffer;
 - appends writes and consumes data as it is read;
@@ -31,11 +31,16 @@ sudo dmesg | tail
 The device node should be created automatically by `udev`. No manual `mknod`
 command is required.
 
-The FIFO size and initial timer interval can be set when loading the module:
+The device count, FIFO size, and initial timer interval can be set when loading
+the module:
 
 ```sh
-sudo insmod mychardev.ko buffer_size=4096 timer_interval_ms=500
+sudo insmod mychardev.ko device_count=4 buffer_size=4096 timer_interval_ms=500
 ```
+
+`device_count` must be between 1 and 64. When `device_count=1`, the driver
+creates `/dev/mychardev`. When more than one device is requested, the driver
+creates numbered nodes such as `/dev/mychardev0` and `/dev/mychardev1`.
 
 `buffer_size` is expressed in bytes and must be between 1 and 1048576.
 The default is 1024. Use `MYCHARDEV_IOC_GET_INFO` to read the active FIFO
@@ -52,6 +57,13 @@ use `sudo`:
 ```sh
 printf 'hello from userspace\n' | sudo tee /dev/mychardev >/dev/null
 sudo cat /dev/mychardev
+```
+
+For multiple devices, use the numbered node you want to test:
+
+```sh
+printf 'hello dev0\n' | sudo tee /dev/mychardev0 >/dev/null
+sudo cat /dev/mychardev0
 ```
 
 Writes append as much data as the ring buffer can hold. Reads consume available
